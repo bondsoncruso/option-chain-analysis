@@ -34,7 +34,6 @@ url_indices = "https://www.nseindia.com/api/allIndices"
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
     'Referer': 'https://www.nseindia.com/',
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
