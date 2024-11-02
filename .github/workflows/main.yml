@@ -2,7 +2,7 @@ name: Run Python Script on Schedule
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # Runs daily at 3:00 AM UTC
+    - cron: '15 9 * * 1-5'  # Runs at 9:15 AM UTC, Monday through Friday
   workflow_dispatch:
 
 jobs:
