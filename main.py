@@ -3,7 +3,6 @@ import json
 import math
 import pandas as pd
 from datetime import datetime, timedelta
-import os
 
 # Input Parameters
 symbol = "NIFTY"  # Options: "NIFTY" or "BANKNIFTY"
@@ -36,18 +35,13 @@ headers = {
 # Session setup
 sess = requests.Session()
 
-# Fetch data from URL with retry logic
-def get_data(url, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            response = sess.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            return response.text
-        except requests.exceptions.RequestException as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise
-            continue
+# Fetch data from URL
+def get_data(url):
+    response = sess.get(url, headers=headers, timeout=10)
+    if response.status_code == 200:
+        return response.text
+    else:
+        raise Exception(f"Failed to fetch data. Status code: {response.status_code}")
 
 # Set session cookies
 def set_cookie():
@@ -59,13 +53,11 @@ def fetch_indices_data():
     response_text = get_data(url_indices)
     data = json.loads(response_text)
     ul_price = next(
-        (index["last"] for index in data["data"]
-         if (symbol == "NIFTY" and index["index"] == "NIFTY 50") or
-            (symbol == "BANKNIFTY" and index["index"] == "NIFTY BANK")),
-        None
+        index["last"]
+        for index in data["data"]
+        if (symbol == "NIFTY" and index["index"] == "NIFTY 50")
+        or (symbol == "BANKNIFTY" and index["index"] == "NIFTY BANK")
     )
-    if ul_price is None:
-        raise ValueError("Unable to find the underlying price for the specified symbol.")
     nearest_strike_price = int(round(ul_price / default_step) * default_step)
     return ul_price, nearest_strike_price
 
@@ -73,10 +65,8 @@ def fetch_indices_data():
 def fetch_option_chain():
     response_text = get_data(url_nf)
     data = json.loads(response_text)
-    expiry_dates = data.get("records", {}).get("expiryDates", [])
-    option_data = data.get("records", {}).get("data", [])
-    if not expiry_dates or not option_data:
-        raise ValueError("Expiry dates or option chain data is missing.")
+    expiry_dates = data["records"]["expiryDates"]
+    option_data = data["records"]["data"]
     return expiry_dates, option_data
 
 # Prepare DataFrame for the selected expiry
@@ -111,24 +101,21 @@ def send_discord_message(data):
     headers = {"Content-Type": "application/json"}
     response = requests.post(webhook_url, json=data, headers=headers)
     if response.status_code == 204:
-        print("Message sent successfully to Discord.")
+        print("Message sent successfully.")
     else:
         print(f"Failed to send message. Response: {response.text}")
 
 # Process expiry data and send to Discord
 def process_and_send(df, expiry_date, ltp, t_days, expiry_type):
-    try:
-        atm_strike = int(round(ltp / default_step) * default_step)
-        next_strike = atm_strike + default_step
-        iv_values = [
-            df[df["Strike"] == atm_strike]["CE IV"].values[0],
-            df[df["Strike"] == next_strike]["CE IV"].values[0],
-            df[df["Strike"] == atm_strike]["PE IV"].values[0],
-            df[df["Strike"] == next_strike]["PE IV"].values[0],
-        ]
-    except IndexError:
-        print("Error: Could not find ATM or next strike IV values.")
-        return
+    # Fetch ATM IV values
+    atm_strike = int(round(ltp / default_step) * default_step)
+    next_strike = atm_strike + default_step
+    iv_values = [
+        df[df["Strike"] == atm_strike]["CE IV"].values[0],
+        df[df["Strike"] == next_strike]["CE IV"].values[0],
+        df[df["Strike"] == atm_strike]["PE IV"].values[0],
+        df[df["Strike"] == next_strike]["PE IV"].values[0],
+    ]
 
     # Calculate 1SD and 2SD ranges
     lower_1sd, upper_1sd = calculate_sd_ranges(ltp, t_days, iv_values, sd_multiplier=1)
@@ -160,15 +147,12 @@ def process_and_send(df, expiry_date, ltp, t_days, expiry_type):
     send_discord_message({"embeds": [embed]})
 
 # Main Execution
-try:
-    set_cookie()
-    ul_price, nearest_strike_price = fetch_indices_data()
-    expiry_dates, option_data = fetch_option_chain()
+set_cookie()
+ul_price, nearest_strike_price = fetch_indices_data()
+expiry_dates, option_data = fetch_option_chain()
 
-    # Process current and next expiry
-    for idx, expiry_date in enumerate(expiry_dates[:2]):  # Process only current and next expiry
-        df = prepare_dataframe(option_data, expiry_date)
-        t_days = calculate_trading_days(datetime.now(), datetime.strptime(expiry_date, "%d-%b-%Y"))
-        process_and_send(df, expiry_date, ul_price, t_days, f"Expiry {idx + 1}")
-except Exception as e:
-    print(f"An error occurred: {e}")
+# Process current and next expiry
+for idx, expiry_date in enumerate(expiry_dates[:2]):  # Process only current and next expiry
+    df = prepare_dataframe(option_data, expiry_date)
+    t_days = calculate_trading_days(datetime.now(), datetime.strptime(expiry_date, "%d-%b-%Y"))
+    process_and_send(df, expiry_date, ul_price, t_days, f"Expiry {idx + 1}")
