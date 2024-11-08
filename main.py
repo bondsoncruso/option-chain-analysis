@@ -1,4 +1,3 @@
-# Libraries
 import requests
 import json
 import math
@@ -6,309 +5,170 @@ import pandas as pd
 from datetime import datetime, timedelta
 import os
 
-# Input Parameters - You can change these
-symbol = "NIFTY"         # Options: "NIFTY" or "BANKNIFTY"
-default_step = 50        # Step size for strike rounding (50 for NIFTY, 100 for BANKNIFTY)
-
-# Function to Get Nearest Strike Price
-def round_nearest(x, num=50): return int(math.ceil(float(x) / num) * num)
-def nearest_strike(x): return round_nearest(x, default_step if symbol == "NIFTY" else 100)
+# Input Parameters
+symbol = "NIFTY"  # Options: "NIFTY" or "BANKNIFTY"
+default_step = 50 if symbol == "NIFTY" else 100  # Strike step size
 
 # Function to calculate trading days between two dates
 def calculate_trading_days(start_date, end_date):
     trading_days = 0
     current_date = start_date
     while current_date <= end_date:
-        # Count only weekdays (Monday=0, ..., Friday=4)
-        if current_date.weekday() < 5:
+        if current_date.weekday() < 5:  # Count only weekdays
             trading_days += 1
         current_date += timedelta(days=1)
     return trading_days
 
 # URLs for fetching data
 url_oc = "https://www.nseindia.com/option-chain"
-url_nf = f'https://www.nseindia.com/api/option-chain-indices?symbol={symbol}'
+url_nf = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
 url_indices = "https://www.nseindia.com/api/allIndices"
 
 # Headers for requests
 headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': 'https://www.nseindia.com/',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Sec-Fetch-Dest': 'document'
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
 }
 
 # Session setup
 sess = requests.Session()
-cookies = dict()
 
-# Set cookies for session
+# Fetch data from URL with retry logic
+def get_data(url, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            response = sess.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                raise
+            continue
+
+# Set session cookies
 def set_cookie():
-    global cookies
     response = sess.get(url_oc, headers=headers, timeout=10)
-    cookies = dict(response.cookies)
-    sess.cookies.update(cookies)
+    sess.cookies.update(dict(response.cookies))
 
-# Fetch data from URL
-def get_data(url):
-    response = sess.get(url, headers=headers, timeout=10)
-    if response.status_code == 200:
-        return response.text
-    else:
-        print(f"Failed to get data from {url}. Status code: {response.status_code}")
-        return ""
-
-# Set header and global variables for indices data
-def set_header():
-    global nearest_strike_price, ul_price, expiry_date
+# Fetch underlying price and nearest strike price
+def fetch_indices_data():
     response_text = get_data(url_indices)
-    if not response_text:
-        print("Failed to retrieve data from NSE indices API.")
-        exit()
     data = json.loads(response_text)
-    ul_price = 0
+    ul_price = next(
+        (index["last"] for index in data["data"]
+         if (symbol == "NIFTY" and index["index"] == "NIFTY 50") or
+            (symbol == "BANKNIFTY" and index["index"] == "NIFTY BANK")),
+        None
+    )
+    if ul_price is None:
+        raise ValueError("Unable to find the underlying price for the specified symbol.")
+    nearest_strike_price = int(round(ul_price / default_step) * default_step)
+    return ul_price, nearest_strike_price
 
-    # Get last price for symbol
-    for index in data["data"]:
-        if (symbol == "NIFTY" and index["index"] == "NIFTY 50") or (symbol == "BANKNIFTY" and index["index"] == "NIFTY BANK"):
-            ul_price = index["last"]
-            break
-    nearest_strike_price = nearest_strike(ul_price)
-
-    # Get nearest expiry date
+# Fetch expiry dates and option chain data
+def fetch_option_chain():
     response_text = get_data(url_nf)
-    if not response_text:
-        print("Failed to retrieve option chain data.")
-        exit()
     data = json.loads(response_text)
-    expiry_date = data["records"]["expiryDates"][0]
+    expiry_dates = data.get("records", {}).get("expiryDates", [])
+    option_data = data.get("records", {}).get("data", [])
+    if not expiry_dates or not option_data:
+        raise ValueError("Expiry dates or option chain data is missing.")
+    return expiry_dates, option_data
 
-# Fetch and organize option chain data into a DataFrame
-def fetch_option_chain(url, expiry_date):
-    response_text = get_data(url)
-    if not response_text:
-        print("Failed to retrieve option chain data.")
-        exit()
-    data = json.loads(response_text)
+# Prepare DataFrame for the selected expiry
+def prepare_dataframe(option_data, expiry_date):
+    option_list = [
+        [
+            item.get("CE", {}).get("impliedVolatility", 0),
+            item.get("PE", {}).get("impliedVolatility", 0),
+            item["strikePrice"],
+        ]
+        for item in option_data
+        if item["expiryDate"] == expiry_date
+    ]
+    return pd.DataFrame(option_list, columns=["CE IV", "PE IV", "Strike"])
 
-    # Prepare data list for DataFrame
-    option_data = []
-    for item in data['records']['data']:
-        if item["expiryDate"] == expiry_date:
-            strike_price = item["strikePrice"]
-
-            # Get CE and PE data, handle cases where data might be missing
-            ce_data = item.get("CE", {})
-            pe_data = item.get("PE", {})
-
-            # Append row with the specified column order
-            option_data.append([
-                ce_data.get("impliedVolatility", 0),
-                pe_data.get("impliedVolatility", 0),
-                strike_price,
-            ])
-
-    # Create DataFrame with specified column names
-    columns = ["CE IV", "PE IV", "Strike"]
-    df = pd.DataFrame(option_data, columns=columns)
-    return df
-
-def calculate_1sd_range(ltp, t_days, atm_call_iv, atm_call_iv2, atm_put_iv, atm_put_iv2):
-    """
-    Calculate the 1 Standard Deviation (1SD) range based on LTP, time to expiry, 
-    and implied volatilities of ATM call and put options.
-        
-    Parameters:
-    - ltp (float): Latest Traded Price
-    - t_days (int): Time to Expiry (TTE) in market trading days
-    - atm_call_iv (float): ATM Call Implied Volatility
-    - atm_call_iv2 (float): Alternate ATM Call Implied Volatility
-    - atm_put_iv (float): ATM Put Implied Volatility
-    - atm_put_iv2 (float): Alternate ATM Put Implied Volatility
-        
-    Returns:
-    - dict: Dictionary containing CIV, DV, MV, lower 1SD, and upper 1SD
-    """
-    # Step 1: Calculate Cumulative Implied Volatility (CIV)
-    civ = (atm_call_iv + atm_call_iv2 + atm_put_iv + atm_put_iv2) / 4
-
-    # Step 2: Calculate Daily Volatility (DV)
+# Calculate the 1SD range
+def calculate_sd_ranges(ltp, t_days, iv_values, sd_multiplier=1):
+    civ = sum(iv_values) / len(iv_values)
     dv = civ / math.sqrt(252)
-
-    # Step 3: Calculate Monthly Volatility (MV) for the remaining days until expiry
     mv = dv * math.sqrt(t_days)
+    sd_range = ltp * (mv / 100) * sd_multiplier
+    lower_sd = ltp - sd_range
+    upper_sd = ltp + sd_range
+    return lower_sd, upper_sd
 
-    # Step 4: Calculate the 1 Standard Deviation (1SD) range
-    lower_sd = ltp - (ltp * (mv / 100))
-    upper_sd = ltp + (ltp * (mv / 100))
-
-    # Return the results as a dictionary
-    return {
-        "CIV": civ,
-        "DV": dv,
-        "MV": mv,
-        "Lower 1SD": lower_sd,
-        "Upper 1SD": upper_sd
-    }
-
-# Main Execution
-set_cookie()
-set_header()
-
-df = fetch_option_chain(url_nf, expiry_date)
-
-expiry_date_obj = datetime.strptime(expiry_date, "%d-%b-%Y")
-current_date = datetime.now()
-
-# Automatically determined inputs based on fetched data
-ltp = ul_price  # Latest Traded Price (LTP), dynamically set from the index data
-t_days = calculate_trading_days(current_date, expiry_date_obj)  # Time to Expiry (TTE), calculated dynamically
-
-# Fetch ATM IVs
-atm_strike = nearest_strike_price
-next_strike = atm_strike + default_step
-
-atm_call_iv = df[df['Strike'] == atm_strike]['CE IV'].values[0]
-atm_call_iv2 = df[df['Strike'] == next_strike]['CE IV'].values[0]
-atm_put_iv = df[df['Strike'] == atm_strike]['PE IV'].values[0]
-atm_put_iv2 = df[df['Strike'] == next_strike]['PE IV'].values[0]
-
-# Call the function
-result = calculate_1sd_range(ltp, t_days, atm_call_iv, atm_call_iv2, atm_put_iv, atm_put_iv2)
-
-# Calculate Iron Condor legs based on 1SD range
-lower_leg = int(math.floor(result['Lower 1SD'] / default_step) * default_step)
-upper_leg = int(math.ceil(result['Upper 1SD'] / default_step) * default_step)
-outer_lower_leg = lower_leg - (4 * default_step)
-outer_upper_leg = upper_leg + (4 * default_step)
-
-formatted_current_date = current_date.strftime("%d-%b-%Y")
-
-import requests
-
-def send_discord_message():
+# Send data to Discord
+def send_discord_message(data):
     webhook_url = os.environ.get('DISCORD_WEBHOOK_URL')
     if not webhook_url:
-        print("Discord webhook URL not found in environment variables.")
-        exit()
-    # Construct the embed
-    embed = {
-        "title": f"{symbol} Option Chain Analysis",
-        "description": f"Data fetched on {formatted_current_date}",
-        "color": 5814783,  # Optional: Change the color code as desired
-        "fields": [
-            {
-                "name": "**INSTRUMENT**",
-                "value": symbol,
-                "inline": True
-            },
-            {
-                "name": "**EXPIRY DATE**",
-                "value": expiry_date,
-                "inline": True
-            },
-            {
-                "name": "**CURRENT DATE**",
-                "value": formatted_current_date,
-                "inline": True
-            },
-            {
-                "name": "**TIME TO EXPIRY**",
-                "value": f"{t_days} trading days",
-                "inline": True
-            },
-            {
-                "name": "**NEAREST STRIKE**",
-                "value": str(nearest_strike_price),
-                "inline": True
-            },
-            {
-                "name": "**LAST TRADED PRICE**",
-                "value": str(ul_price),
-                "inline": True
-            },
-            {
-                "name": "**1 STANDARD DEVIATION (1SD) CALCULATION RESULTS**",
-                "value": "\u200b",  # Empty value to create a separator
-                "inline": False
-            },
-            {
-                "name": "CIV",
-                "value": f"{result['CIV']:.2f}%",
-                "inline": True
-            },
-            {
-                "name": "DV",
-                "value": f"{result['DV']:.2f}%",
-                "inline": True
-            },
-            {
-                "name": "MV",
-                "value": f"{result['MV']:.2f}% for {t_days} days",
-                "inline": True
-            },
-            {
-                "name": "LOWER 1SD",
-                "value": f"{result['Lower 1SD']:.2f}",
-                "inline": True
-            },
-            {
-                "name": "UPPER 1SD",
-                "value": f"{result['Upper 1SD']:.2f}",
-                "inline": True
-            },
-            {
-                "name": "**IRON CONDOR STRATEGY LEGS**",
-                "value": "\u200b",  # Empty value to create a separator
-                "inline": False
-            },
-            {
-                "name": "SELL",
-                "value": f"{symbol} {expiry_date[:6].upper()} PE {lower_leg}",
-                "inline": False
-            },
-            {
-                "name": "SELL",
-                "value": f"{symbol} {expiry_date[:6].upper()} CE {upper_leg}",
-                "inline": False
-            },
-            {
-                "name": "BUY",
-                "value": f"{symbol} {expiry_date[:6].upper()} PE {outer_lower_leg}",
-                "inline": False
-            },
-            {
-                "name": "BUY",
-                "value": f"{symbol} {expiry_date[:6].upper()} CE {outer_upper_leg}",
-                "inline": False
-            }
-        ],
-        "footer": {
-            "text": "Generated by Github Actions"
-        }
-    }
-
-    data = {
-        "embeds": [embed]
-    }
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    response = requests.post(
-        webhook_url, json=data, headers=headers
-    )
-
+        print("Discord webhook URL not found. Please set the DISCORD_WEBHOOK_URL environment variable.")
+        return
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(webhook_url, json=data, headers=headers)
     if response.status_code == 204:
         print("Message sent successfully to Discord.")
     else:
-        print(f"Failed to send message to Discord: {response.text}")
+        print(f"Failed to send message. Response: {response.text}")
 
-# Send the message via Discord
-send_discord_message()
+# Process expiry data and send to Discord
+def process_and_send(df, expiry_date, ltp, t_days, expiry_type):
+    try:
+        atm_strike = int(round(ltp / default_step) * default_step)
+        next_strike = atm_strike + default_step
+        iv_values = [
+            df[df["Strike"] == atm_strike]["CE IV"].values[0],
+            df[df["Strike"] == next_strike]["CE IV"].values[0],
+            df[df["Strike"] == atm_strike]["PE IV"].values[0],
+            df[df["Strike"] == next_strike]["PE IV"].values[0],
+        ]
+    except IndexError:
+        print("Error: Could not find ATM or next strike IV values.")
+        return
+
+    # Calculate 1SD and 2SD ranges
+    lower_1sd, upper_1sd = calculate_sd_ranges(ltp, t_days, iv_values, sd_multiplier=1)
+    lower_2sd, upper_2sd = calculate_sd_ranges(ltp, t_days, iv_values, sd_multiplier=1.3)
+
+    # Calculate Iron Condor legs
+    lower_leg = int(math.floor(lower_1sd / default_step) * default_step)
+    upper_leg = int(math.ceil(upper_1sd / default_step) * default_step)
+    outer_lower_leg = int(math.floor(lower_2sd / default_step) * default_step)
+    outer_upper_leg = int(math.ceil(upper_2sd / default_step) * default_step)
+
+    # Prepare embed for Discord
+    embed = {
+        "title": f"{symbol} Option Chain Analysis - {expiry_type}",
+        "description": f"Data fetched for expiry on {expiry_date}",
+        "color": 5814783,
+        "fields": [
+            {"name": "**LTP**", "value": f"{ltp}", "inline": True},
+            {"name": "**1 SD Range**", "value": f"{lower_1sd:.2f} - {upper_1sd:.2f}", "inline": True},
+            {"name": "**2 SD Range**", "value": f"{lower_2sd:.2f} - {upper_2sd:.2f}", "inline": True},
+            {"name": "**Iron Condor Legs**", "value": "\u200b", "inline": False},
+            {"name": "SELL", "value": f"{symbol} {expiry_date} PE {lower_leg}", "inline": False},
+            {"name": "SELL", "value": f"{symbol} {expiry_date} CE {upper_leg}", "inline": False},
+            {"name": "BUY", "value": f"{symbol} {expiry_date} PE {outer_lower_leg}", "inline": False},
+            {"name": "BUY", "value": f"{symbol} {expiry_date} CE {outer_upper_leg}", "inline": False},
+        ],
+    }
+
+    send_discord_message({"embeds": [embed]})
+
+# Main Execution
+try:
+    set_cookie()
+    ul_price, nearest_strike_price = fetch_indices_data()
+    expiry_dates, option_data = fetch_option_chain()
+
+    # Process current and next expiry
+    for idx, expiry_date in enumerate(expiry_dates[:2]):  # Process only current and next expiry
+        df = prepare_dataframe(option_data, expiry_date)
+        t_days = calculate_trading_days(datetime.now(), datetime.strptime(expiry_date, "%d-%b-%Y"))
+        process_and_send(df, expiry_date, ul_price, t_days, f"Expiry {idx + 1}")
+except Exception as e:
+    print(f"An error occurred: {e}")
